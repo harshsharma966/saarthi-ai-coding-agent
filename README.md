@@ -29,6 +29,7 @@
   - **Interactive Git-Style Diff Visualizer**: Real-time visual comparison showing additions (`+`) and deletions (`-`) before file changes are applied.
 - **🚨 Autonomous Self-Debugging**:
   - Automatically captures non-zero terminal exit codes and Python syntax/runtime tracebacks, rewrites faulty logic, and re-executes without manual intervention.
+  - **Auto-Package Recovery**: Detects missing Python modules (`ImportError` / `ModuleNotFoundError`) and initiates a `pip install` terminal approval card to resolve dependencies on the fly.
 - **🧠 Hybrid Long-Term & Short-Term Memory**:
   - **Short-Term Session Memory**: Resilient checkpoints via LangGraph `PostgresSaver`.
   - **Key-Value Fact Memory**: Auto-extracts facts into `PostgresStore`.
@@ -38,26 +39,98 @@
 
 ---
 
+## 📸 Live Agent in Action (Real Demo)
+
+> **Live Proof:** Saarthi solving LeetCode 438 (*Find All Anagrams in a String*), explaining the sliding window algorithm, and proactively asking to persist the file:
+
+<p align="center">
+  <img src="assets/demo/1_leetcode_prompt.jpg" alt="1. User LeetCode Prompt" width="95%" style="border-radius: 8px; margin-bottom: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1);" />
+  <img src="assets/demo/2_agent_code_generation.jpg" alt="2. Agent Generates Optimal Solution" width="95%" style="border-radius: 8px; margin-bottom: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1);" />
+  <img src="assets/demo/3_agent_proactive_save_suggestion.jpg" alt="3. Proactive Saving Suggestion" width="95%" style="border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.1);" />
+</p>
+
+1. **Intelligent Comprehension**: Automatically extracts problem constraints, examples, and edge cases.
+2. **Clean Code Generation**: Produces optimal $O(N)$ sliding window logic with Python `collections.Counter`.
+3. **Interactive Human Partnership**: Rather than blindly polluting the workspace, it presents the solution first and politely asks for confirmation and filename before executing disk operations.
+
+---
+
+## 🤖 Local Models Architecture
+
+The entire system runs **100% locally** powered by Ollama:
+
+| Model | Type | Library | Purpose & Responsibilities |
+| :--- | :--- | :--- | :--- |
+| **`qwen2.5-coder:7b`** | Chat LLM | `langchain-ollama` (`ChatOllama`) | • **Architect Planner**: Formulates 2-3 step execution roadmaps<br>• **Coder & Debugger**: Implements solutions & invokes tools<br>• **QA Reviewer**: Verifies executions & catches tracebacks<br>• **Memory Extractor**: Auto-detects user facts & habits<br>• **Title Generator**: Creates 3-5 word thread topic titles |
+| **`qwen3-embedding:4b`** | Embeddings | `langchain-ollama` (`OllamaEmbeddings`) | • **Codebase Vectors**: Ingests code & PDFs into `collection: codebase`<br>• **Semantic Memory**: Embeds long-term user preferences into `collection: user_memories` |
+
+---
+
 ## 🏗️ Architecture & Flow
 
 ```mermaid
 graph TD
     User([User Request / Prompt]) --> API[FastAPI /chat/stream]
-    API --> Planner[Architect Planner Node]
-    Planner --> Coder[Coder & Debugger Node]
+    API --> Checkpoint[(Postgres: checkpoints)]
+    Checkpoint --> Planner[1. Architect Planner Node]
+    Planner --> Coder[2. Coder & Debugger Node]
     
-    Coder -->|Calls Tool| Tools{Sensitive Action?}
-    Tools -->|write / edit / run_command| HITL[Human-In-The-Loop Interrupt]
-    HITL -->|User Approves / Rejects| Tools
-    Tools -->|Tool Output| Coder
+    Coder -->|Tool Call Requested| Router1{coder_router}
+    Router1 -->|tool_calls present| Tools[3. Tools Node]
     
-    Coder --> Reviewer[QA Reviewer Node]
-    Reviewer -->|Error Detected| Coder
-    Reviewer -->|Next Step| Coder
-    Reviewer -->|All Steps Complete & Verified| Memory[Memory Extractor Node]
-    Memory --> DB[(PostgreSQL: Checkpoints + Store + pgvector)]
-    Memory --> Response([Final Streamed Response])
+    Tools -->|write_file / edit_file / run_terminal_command| HITL[🛑 Human-In-The-Loop Interrupt]
+    HITL -->|User Approves / Rejects on UI| Tools
+    Tools -->|Tool Output / Result| Coder
+    
+    Router1 -->|Active Multi-Step Plan| Reviewer[4. QA Reviewer Node]
+    Router1 -->|Direct / Casual / Single Turn| Memory[5. Memory Extractor Node]
+    
+    Reviewer --> Router2{reviewer_router}
+    Router2 -->|Error Detected: Rejected| Coder
+    Router2 -->|Next Step in Plan| Coder
+    Router2 -->|All Plan Steps Complete| Memory
+    
+    Memory --> DB[(PostgreSQL: store + pgvector)]
+    Memory --> Response([Final Streamed SSE Response])
 ```
+
+### 🔄 State Schema (`MyState`)
+
+Every node reads and mutates a central Typed State:
+
+```python
+class MyState(BaseModel):
+    messages: Annotated[list[AnyMessage], add_messages]  # Merged chat history (Human, AI, Tool)
+    response: str = ""                                  # Streamed response text
+    debug_retries: int = 0                              # Autonomous self-debugging retry counter
+    plan: list[str] = []                                # Discrete 2-3 step execution plan
+    current_step: int = 0                               # Currently executing step index
+    review_status: str = "pending"                      # 'pending' | 'approved' | 'rejected'
+    review_feedback: str = ""                           # Reviewer feedback / traceback details
+    completed_task: str = ""                            # Description of last completed step
+    memory_updated: bool = False                        # Set True when new facts are saved
+    saved_count: int = 0                                # Number of facts stored
+```
+
+---
+
+## 🚀 Real-World Walkthrough: State Lifecycle
+
+Consider this user prompt:
+> **User Prompt:** *"Mera naam Harsh hai. Desktop par ek valid parentheses checker ka python code save kar do."*
+
+Here is how each node processes the request and updates the internal state:
+
+| Stage & Node | Action & Decisions | State Mutation (`MyState`) |
+| :--- | :--- | :--- |
+| **1. `START` ➔ `planner`** | Detects direct save intent (`"desktop"`, `"save"`). Skips unnecessary multi-step breakdown. | `plan: []`, `review_status: "approved"` |
+| **2. `coder` (Turn 1)** | `qwen2.5-coder:7b` generates the algorithm and issues a structured tool call. | `messages += [AIMessage(tool_calls=[write_file])]` |
+| **3. `tools` (HITL Interrupt)** | Sensitive operation pauses graph (`interrupt`). React UI shows **Approval Card**. User clicks **Approve**. File written to `~/Desktop/valid_parentheses.py`. | `messages += [ToolMessage("Successfully wrote 420 chars")]` |
+| **4. `coder` (Turn 2)** | Receives `ToolMessage`. Formulates polite completion message to the user. | `messages += [AIMessage("Valid parentheses code save kar diya hai!")]`, `response = "..."` |
+| **5. `memory_extractor`** | Scans dialogue, detects personal signal (*"Mera naam Harsh"*). Saves `name: "Harsh"` to `store` ($O(1)$) and `pgvector`. | `memory_updated: true`, `saved_count: 1` |
+| **6. `END`** | Commits state snapshot into `checkpoints` table. Streams final tokens to React UI. | Checkpoint saved in PostgreSQL. |
+
+---
 
 ---
 
@@ -83,9 +156,9 @@ coading-agent/
 │   │   ├── retriever.py           # Similarity search retriever
 │   │   └── vector_db.py           # Vector collection setup
 │   └── routers/
-│       ├── chat.py                # SSE streaming chat, title gen & approvals
-│       ├── memory.py              # Long-term memory CRUD endpoints
-│       └── rag_routes.py          # File upload & document ingestion
+│       ├── chat.py                # SSE streaming chat, title gen, approvals & file/PDF ingestion
+│       ├── memory.py              # Long-term memory CRUD endpoints (store + pgvector)
+│       └── rag_routes.py          # Vector similarity search test & collection stats
 ├── frontend/
 │   ├── src/
 │   │   ├── components/
@@ -136,7 +209,7 @@ python -m venv ../venv
 # source ../venv/bin/activate # On Linux/macOS
 
 # Install dependencies
-pip install fastapi uvicorn langgraph langchain-ollama langchain-postgres psycopg[binary] python-dotenv langchain-text-splitters pgvector
+pip install fastapi uvicorn langgraph langchain-ollama langchain-postgres "psycopg[binary,pool]" python-dotenv langchain-text-splitters pgvector pypdf
 
 # Run Backend
 python main.py
@@ -174,12 +247,14 @@ npm run dev
 | :--- | :--- | :--- |
 | `read_file` | Inspects workspace code files | Auto-Approved |
 | `list_directory` | Navigates directories and folder trees | Auto-Approved |
-| `search_codebase` | Semantic vector search across all files | Auto-Approved |
+| `search_codebase` | Semantic vector search across all files and ingested PDFs | Auto-Approved |
 | `write_file` | Creates or overwrites complete files | ⚠️ **HITL Approval Required** |
 | `edit_file` | Applies unified diffs / selective replacements | ⚠️ **HITL Approval Required** |
 | `run_terminal_command`| Executes shell commands safely | ⚠️ **HITL Approval Required** |
-| `execute_python_code` | Runs Python scripts with self-debugging | Sandboxed Execution |
-| `save_memory` / `get_memory` | Manages persistent user preferences | Auto-Approved |
+| `execute_python_code` | Runs Python scripts in memory with self-debugging | Sandboxed Execution |
+| `get_memory` | Retrieves specific user preference or fact by key | Auto-Approved |
+| `list_memories` | Lists all stored persistent user preferences & facts | Auto-Approved |
+| `save_memory` | Manages and updates persistent user preferences | Auto-Approved |
 
 ---
 
